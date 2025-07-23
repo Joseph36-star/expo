@@ -8,10 +8,11 @@ internal class DeleteAssets(
   private val context: Context,
   private val assetIds: Array<String>
 ) {
-  fun execute() {
+  fun execute(): Boolean {
     val selection = "${MediaStore.Images.Media._ID} IN (${assetIds.joinToString(separator = ",")} )"
     val selectionArgs: Array<String>? = null
 
     MediaLibraryUtils.deleteAssets(context, selection, selectionArgs)
+    return true
   }
 }

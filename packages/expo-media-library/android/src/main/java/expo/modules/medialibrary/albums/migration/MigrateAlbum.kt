@@ -17,7 +17,6 @@ internal class MigrateAlbum(
   private val context: Context,
   private val assetFiles: List<AssetFile>,
   private val albumDirName: String,
-  private val promise: Promise
 ) {
   fun execute() {
     // Previously, users were able to save different assets type in the same directory.
@@ -47,6 +46,5 @@ internal class MigrateAlbum(
           null
         )
     }
-    promise.resolve(null)
   }
 }

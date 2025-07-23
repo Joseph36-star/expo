@@ -19,14 +19,17 @@ import android.os.Binder
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import androidx.activity.result.contract.ActivityResultContracts.StartIntentSenderForResult
 import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresApi
 import expo.modules.core.errors.ModuleDestroyedException
 import expo.modules.interfaces.permissions.Permissions.askForPermissionsWithPermissionsManager
 import expo.modules.interfaces.permissions.Permissions.getPermissionsWithPermissionsManager
 import expo.modules.kotlin.Promise
+import expo.modules.kotlin.activityresult.AppContextActivityResultLauncher
 import expo.modules.kotlin.exception.CodedException
 import expo.modules.kotlin.exception.Exceptions
 import expo.modules.kotlin.functions.Coroutine
@@ -47,12 +50,20 @@ import expo.modules.medialibrary.assets.CreateAssetWithAlbumId
 import expo.modules.medialibrary.assets.DeleteAssets
 import expo.modules.medialibrary.assets.GetAssetInfo
 import expo.modules.medialibrary.assets.GetAssets
+import expo.modules.medialibrary.contracts.DeleteContract
+import expo.modules.medialibrary.contracts.DeleteContractInput
+import expo.modules.medialibrary.contracts.WriteContract
+import expo.modules.medialibrary.contracts.WriteContractInput
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import java.io.Serializable
 import java.lang.ref.WeakReference
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 class MediaLibraryModule : Module() {
   private val context: Context
@@ -60,7 +71,10 @@ class MediaLibraryModule : Module() {
   private val moduleCoroutineScope = CoroutineScope(Dispatchers.IO)
   private var imagesObserver: MediaStoreContentObserver? = null
   private var videosObserver: MediaStoreContentObserver? = null
-  private var awaitingAction: Action? = null
+  private lateinit var deleteLauncher: AppContextActivityResultLauncher<DeleteContractInput, Boolean>
+  private lateinit var writeLauncher: AppContextActivityResultLauncher<WriteContractInput, Boolean>
+  private var continuationDelete: Continuation<Boolean?>? = null
+  private var continuationWrite: Continuation<Boolean?>? = null
   private val isExpoGo by lazy {
     context.resources.getString(R.string.is_expo_go).toBoolean()
   }
@@ -160,15 +174,18 @@ class MediaLibraryModule : Module() {
       requirePermissions()
       val action = actionIfUserGrantedPermission {
         assetId?.let {
-          runBlocking {
+          return@actionIfUserGrantedPermission runBlocking {
             CreateAlbum(context, albumName, assetId, copyAsset).execute()
           }
         }
+
         initialAssetUri?.let {
-          runBlocking {
+          return@actionIfUserGrantedPermission runBlocking {
             CreateAlbumWithInitialFileUri(context, albumName, it).execute()
           }
         }
+
+        null
       }
       val assetIdList = if (!copyAsset && assetId != null) {
         listOf(assetId)
@@ -192,9 +209,9 @@ class MediaLibraryModule : Module() {
       GetAssets(context, assetOptions).execute()
     }
 
-    AsyncFunction("migrateAlbumIfNeededAsync") { albumId: String, promise: Promise ->
+    AsyncFunction("migrateAlbumIfNeededAsync") Coroutine { albumId: String ->
       if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-        return@AsyncFunction
+        return@Coroutine
       }
 
       val assetsIds = getAssetsInAlbums(context, albumId)
@@ -202,7 +219,7 @@ class MediaLibraryModule : Module() {
         .toTypedArray()
       // The album is empty, nothing to migrate
       if (assetsIds.isEmpty()) {
-        return@AsyncFunction
+        return@Coroutine
       }
 
       val assets = MediaLibraryUtils.getAssetsById(
@@ -223,12 +240,12 @@ class MediaLibraryModule : Module() {
 
       val albumDir = assets[0].parentFile ?: throw AlbumPathException()
       if (albumDir.canWrite()) {
-        return@AsyncFunction
+        return@Coroutine
       }
 
       val action = actionIfUserGrantedPermission {
         moduleCoroutineScope.launch {
-          MigrateAlbum(context, assets, albumDir.name, promise)
+          MigrateAlbum(context, assets, albumDir.name)
             .execute()
         }
       }
@@ -296,18 +313,26 @@ class MediaLibraryModule : Module() {
       }
     }
 
-    OnActivityResult { _, payload ->
-      awaitingAction?.takeIf { payload.requestCode == WRITE_REQUEST_CODE || payload.requestCode == DELETE_REQUEST_CODE }?.let {
-        it.runWithPermissions(payload.resultCode == Activity.RESULT_OK)
-        awaitingAction = null
-      }
-    }
-
     OnDestroy {
       try {
         moduleCoroutineScope.cancel(ModuleDestroyedException())
       } catch (e: IllegalStateException) {
         Log.e(TAG, "The scope does not have a job in it")
+      }
+    }
+
+    RegisterActivityContracts {
+      val deleteContract = DeleteContract(this@MediaLibraryModule)
+      val writeContract = WriteContract(this@MediaLibraryModule)
+
+      deleteLauncher = registerForActivityResult(deleteContract) { _, result ->
+        continuationDelete?.resume(result)
+        continuationDelete = null
+      }
+
+      writeLauncher = registerForActivityResult(writeContract) { _, result ->
+        continuationWrite?.resume(result)
+        continuationWrite = null
       }
     }
   }
@@ -392,8 +417,8 @@ class MediaLibraryModule : Module() {
     }
   }
 
-  private fun interface Action {
-    fun runWithPermissions(permissionsWereGranted: Boolean)
+  private fun interface Action<out T> {
+    fun runWithPermissions(permissionsWereGranted: Boolean): T
   }
 
   private fun hasReadPermissions(): Boolean {
@@ -432,7 +457,11 @@ class MediaLibraryModule : Module() {
       ?.not() ?: false
   }
 
-  private fun runActionWithPermissions(assetsId: List<String>, action: Action, useDeletePermission: Boolean = false) {
+  private suspend fun <T> runActionWithPermissions(
+    assetsId: List<String>,
+    action: Action<T>,
+    useDeletePermission: Boolean = false
+  ): T {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
       val pathsWithoutPermissions = MediaLibraryUtils.getAssetsUris(context, assetsId)
         .filter { uri ->
@@ -444,35 +473,29 @@ class MediaLibraryModule : Module() {
         }
 
       if (pathsWithoutPermissions.isNotEmpty()) {
-        val request = if (useDeletePermission) {
-          MediaStore.createDeleteRequest(context.contentResolver, pathsWithoutPermissions)
-        } else {
-          MediaStore.createWriteRequest(context.contentResolver, pathsWithoutPermissions)
+        val granted = suspendCoroutine<Boolean> { continuation ->
+          if (useDeletePermission) {
+            deleteLauncher.launch(DeleteContractInput(uris = pathsWithoutPermissions)) { result ->
+              continuation.resume(result)
+            }
+          } else {
+            writeLauncher.launch(WriteContractInput(uris = pathsWithoutPermissions)) { result ->
+              continuation.resume(result)
+            }
+          }
         }
 
-        try {
-          awaitingAction = action
-          appContext.throwingActivity.startIntentSenderForResult(
-            request.intentSender,
-            if (useDeletePermission) DELETE_REQUEST_CODE else WRITE_REQUEST_CODE,
-            null,
-            0,
-            0,
-            0
-          )
-        } catch (e: SendIntentException) {
-          awaitingAction = null
-          throw e
+        if (!granted) {
+          return action.runWithPermissions(false)
         }
-        // the action will be called when permissions are granted
-        return
       }
     }
-    action.runWithPermissions(true)
+    return action.runWithPermissions(true)
   }
 
-  private fun actionIfUserGrantedPermission(
-    block: () -> Unit
+
+  private fun <T> actionIfUserGrantedPermission(
+    block: () -> T
   ) = Action { permissionsWereGranted ->
     if (!permissionsWereGranted) {
       throw PermissionsException(ERROR_USER_DID_NOT_GRANT_WRITE_PERMISSIONS_MESSAGE)

@@ -154,7 +154,6 @@ class CreateAssetWithAlbumFile(
           result.completeExceptionally(AssetException())
           return@scanFile
         }
-
         if (resolveWithAdditionalData) {
           val selection = MediaStore.Images.Media.DATA + "=?"
           val args = arrayOf(path)
@@ -164,7 +163,6 @@ class CreateAssetWithAlbumFile(
           result.complete(null)
         }
       }
-
       return result.await()
     } catch (e: IOException) {
       throw IOException("Unable to copy file into external storage.", e)
